@@ -2,16 +2,20 @@
 
 A local Python MCP server that extracts representative video frames for coding/debugging context.
 
-The server is optimized to reduce token usage:
+The server includes a session-based workflow optimized for token usage:
 - First call returns only frame references and metadata.
 - Follow-up calls return only the frame image(s) you actually need.
 
+It also provides a one-shot workflow (`analyze_video`) that returns representative
+frames and metadata in a single call.
+
 ## Features
 
-- Scene-based frame selection with PySceneDetect.
-- Fallback to uniform sampling (every 3 seconds) if scene detection fails or times out.
-- 720p output (`1280x720`) with JPEG quality `95`.
-- Max `8` frames per extraction session.
+- Coverage-first representative frame selection (scene + visual-change + uniform sampling).
+- Scene detection timeout fallback with non-scene sampling to preserve coverage.
+- Session extraction output target: `1280x720`; one-shot analysis supports mode presets (`640x360`, `960x540`, `1280x720`).
+- Adaptive JPEG quality fallback (`95 -> 90 -> 82 -> 74 -> 66 -> 58 -> 50`) when needed for response-size coverage.
+- Max `8` frames per session extraction (`get_visual_context` / `get_visual_frames`); one-shot `analyze_video` allows higher mode caps.
 - Temporary frame sessions with automatic expiration and cleanup.
 
 ## Requirements
@@ -59,7 +63,7 @@ python3 server.py
 
 One-shot tool for seamless chat usage.
 
-Returns:
+Key output fields:
 - representative frame images and timestamps in one response
 - sampling metadata (`scene`, `change`, `uniform`, and blended combinations)
 - truncation/size metadata
@@ -70,8 +74,8 @@ Returns:
 - candidate/collection diagnostics (`candidate_timestamp_count`, `collection_timestamp_count`)
 
 Use this when you want to stay in your current chat and just provide a video path.
-For sparse scene detection, the tool automatically blends scene cuts with uniform
-coverage to preserve long-flow context.
+For sparse scene detection, the tool automatically blends scene cuts, visual-change
+sampling, and uniform coverage to preserve long-flow context.
 
 Resolution modes:
 - `flow`: `640x360`, default `28` frames, cap `64` (best for long flows/animation debugging)
@@ -115,13 +119,14 @@ Auto guideline guard:
 
 Creates a temporary frame session and returns metadata only.
 
-Returns:
+Key output fields:
 - `session_id`
 - session token budget state (`session_estimated_tokens_budget`, `session_estimated_tokens_used`, `session_estimated_tokens_remaining`)
 - `frames[]` with `frame_id`, timestamp, dimensions, file path, and byte size
 - sampling method (`scene`, `change`, `uniform`, or blends like `scene+change+uniform`)
 - truncation/size metadata
 - coverage diagnostics (`coverage_level`, `coverage_percentage`, `tail_gap_sec`, `uncertain_intervals`)
+- end-coverage metadata (`ensure_end_frame`, `end_frame_forced`)
 
 ### `get_visual_frame(session_id: str, frame_id: str)`
 
@@ -134,6 +139,7 @@ Returns multiple frame images in one call.
 
 Behavior:
 - If `frame_ids` is omitted, returns all frames in the session (up to limits).
+- Hard cap: returns at most `8` frames per call (`MAX_FRAMES`).
 - Enforces `max_frames`, response-size budget, and token budget.
 - Sets `truncated: true` if not all requested frames fit.
 - Consumes from session token budget and stops once exhausted.
@@ -141,6 +147,12 @@ Behavior:
 ### `cleanup_visual_context(session_id: str)`
 
 Deletes temporary files for a session immediately.
+
+## MCP Prompts
+
+### `quick_video_review(video_path: str, question?: str, resolution_mode?: "flow" | "balanced" | "detail", max_estimated_tokens?: number, strict_evidence?: boolean, auto_tune?: boolean, ensure_end_frame?: boolean)`
+
+Prompt shortcut that asks the client to call `analyze_video` with sensible defaults.
 
 ## Recommended Workflow
 
@@ -187,7 +199,8 @@ You can still use the session-based tools when you need tighter token control.
     "max_frames": 22,
     "max_estimated_tokens": 26000,
     "strict_evidence": true,
-    "auto_tune": true
+    "auto_tune": true,
+    "ensure_end_frame": true
   }
 }
 ```
@@ -297,4 +310,4 @@ Then restart Claude Desktop.
 - `Video file not found`: verify `video_path` is valid and absolute.
 - `Session expired`: call `get_visual_context` again.
 - Missing frame files: run extraction again (temporary files may have been cleaned).
-- Slow scene detection on long videos: server falls back to uniform sampling automatically.
+- Slow scene detection on long videos: server continues with change/uniform sampling automatically.
