@@ -57,6 +57,35 @@ python3 -m pip install -r requirements.txt
 python3 server.py
 ```
 
+This confirms the server starts. In normal MCP usage, your client launches
+`server.py` automatically, so you usually do not run it manually.
+
+## First-Time MCP Setup (Never Used MCP Before)
+
+1. Complete **Quick Start** above.
+2. Add this server to your MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "video-context": {
+      "command": "python3",
+      "args": ["/absolute/path/to/server.py"]
+    }
+  }
+}
+```
+
+3. Restart your MCP client (VS Code/Cursor/Claude Desktop) after saving config.
+4. Open a chat in your client and run a smoke test prompt:
+   - `Use analyze_video on /absolute/path/to/video.mp4 and summarize key actions.`
+5. If it works, you should see the tool return frame images + metadata (timestamps, coverage, token fields).
+
+Notes:
+- Use absolute paths for both `server.py` and `video_path`.
+- The MCP client starts/stops the server process for you.
+- If tools are not visible after config changes, fully restart the client.
+
 ## MCP Tools
 
 ### `analyze_video(video_path: str, question?: str, max_frames?: number, resolution_mode?: "flow" | "balanced" | "detail", max_estimated_tokens?: number, strict_evidence?: boolean, auto_tune?: boolean, ensure_end_frame?: boolean)`
@@ -256,6 +285,8 @@ You can still use the session-based tools when you need tighter token control.
 ## VS Code / Cursor Setup
 
 Add an MCP server entry using either a virtualenv Python binary or your system Python.
+If this is your first MCP setup, open VS Code/Cursor settings and search for `MCP`
+or `Model Context Protocol`, then add a server with the values below.
 
 ### Option A: Use venv Python
 
@@ -282,13 +313,19 @@ Example MCP config:
 }
 ```
 
-Then restart your MCP server from VS Code/Cursor.
+Then restart VS Code/Cursor (or reload MCP servers from the client UI).
+Open a chat and run a quick check:
+- `Use analyze_video on /absolute/path/to/video.mp4 and list timestamps only.`
 
 Tip: if your MCP client surfaces prompts, use the `quick_video_review` prompt for a fast one-shot flow.
 
 ## Claude Desktop Setup
 
 Edit `claude_desktop_config.json` and add:
+
+- macOS (typical): `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows (typical): `%APPDATA%\Claude\claude_desktop_config.json`
+- Linux (typical): `~/.config/Claude/claude_desktop_config.json`
 
 ```json
 {
