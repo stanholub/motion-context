@@ -55,28 +55,88 @@ python3 server.py
 
 ## MCP Tools
 
+### `analyze_video(video_path: str, question?: str, max_frames?: number, resolution_mode?: "flow" | "balanced" | "detail", max_estimated_tokens?: number, strict_evidence?: boolean, auto_tune?: boolean, ensure_end_frame?: boolean)`
+
+One-shot tool for seamless chat usage.
+
+Returns:
+- representative frame images and timestamps in one response
+- sampling metadata (`scene`, `change`, `uniform`, and blended combinations)
+- truncation/size metadata
+- estimated token metadata (`approx_estimated_tokens`, `token_limited`)
+- effective JPEG quality (`jpeg_quality_used`) when quality fallback is applied
+- coverage diagnostics (`coverage_level`, `coverage_percentage`, `max_gap_sec`, `tail_gap_sec`, `uncertain_intervals`)
+- end-coverage enforcement metadata (`ensure_end_frame`, `end_frame_forced`)
+- candidate/collection diagnostics (`candidate_timestamp_count`, `collection_timestamp_count`)
+
+Use this when you want to stay in your current chat and just provide a video path.
+For sparse scene detection, the tool automatically blends scene cuts with uniform
+coverage to preserve long-flow context.
+
+Resolution modes:
+- `flow`: `640x360`, default `28` frames, cap `64` (best for long flows/animation debugging)
+- `balanced`: `960x540`, default `14` frames, cap `40` (recommended default)
+- `detail`: `1280x720`, default `8` frames, cap `8` (best for tiny text/detail)
+
+Token guard:
+- per-mode default token budgets: `flow=22000`, `balanced=18000`, `detail=16000`
+- hard ceiling for any request: `75000`
+- if exceeded, frames are reduced automatically and `token_limited` is returned
+- session-based tools (`get_visual_frame`, `get_visual_frames`) also enforce cumulative
+  session budget (`75000` by default) and stop once exhausted
+
+Anti-hallucination guard:
+- `strict_evidence` defaults to `true`
+- when enabled, consumers should only describe visible evidence and mark uncovered
+  intervals as unknown (see `uncertain_intervals`)
+- for short, action-heavy clips, start with `resolution_mode="flow"` and
+  `max_frames=24..40` to capture micro-interactions
+
+Coverage guard:
+- extraction is coverage-first: candidate timestamps are ordered to prioritize
+  start/end and temporal spread before dense middle frames
+- start (`0s`) and end-of-video timestamps are explicitly anchored in sampling
+- when response-size budget is tight, oversized candidates are skipped (not hard-stop),
+  so later timestamps can still be included
+- `ensure_end_frame=true` (default) attempts to add/replace a frame near the video end
+  if tail coverage is missing
+- inspect `tail_gap_sec` and `coverage_percentage`; if `tail_gap_sec` is above
+  `recommended_max_gap_sec`, treat the ending as uncertain
+
+Auto guideline guard:
+- `auto_tune` defaults to `true`
+- the server inspects your question intent (`low`/`medium`/`high`) and auto-raises
+  too-low `max_frames` and `max_estimated_tokens` to safer minimums
+- this means even if the LLM picks conservative values (for example `max_frames=16`)
+  the server can still boost settings for comprehensive action-level analysis
+- set `auto_tune=false` only if you explicitly want strict manual control
+
 ### `get_visual_context(video_path: str)`
 
 Creates a temporary frame session and returns metadata only.
 
 Returns:
 - `session_id`
+- session token budget state (`session_estimated_tokens_budget`, `session_estimated_tokens_used`, `session_estimated_tokens_remaining`)
 - `frames[]` with `frame_id`, timestamp, dimensions, file path, and byte size
-- sampling method (`scene` or `uniform`)
+- sampling method (`scene`, `change`, `uniform`, or blends like `scene+change+uniform`)
 - truncation/size metadata
+- coverage diagnostics (`coverage_level`, `coverage_percentage`, `tail_gap_sec`, `uncertain_intervals`)
 
 ### `get_visual_frame(session_id: str, frame_id: str)`
 
 Returns a single frame image for one `frame_id`.
+Consumes from session token budget.
 
-### `get_visual_frames(session_id: str, frame_ids?: string[], max_frames?: number)`
+### `get_visual_frames(session_id: str, frame_ids?: string[], max_frames?: number, max_estimated_tokens?: number)`
 
 Returns multiple frame images in one call.
 
 Behavior:
 - If `frame_ids` is omitted, returns all frames in the session (up to limits).
-- Enforces `max_frames` and response-size budget.
+- Enforces `max_frames`, response-size budget, and token budget.
 - Sets `truncated: true` if not all requested frames fit.
+- Consumes from session token budget and stops once exhausted.
 
 ### `cleanup_visual_context(session_id: str)`
 
@@ -89,7 +149,48 @@ Deletes temporary files for a session immediately.
 3. Call `get_visual_frame` or `get_visual_frames`.
 4. Call `cleanup_visual_context` when done.
 
+## Seamless One-Message Workflow
+
+If your chat client supports MCP tools in the current conversation, use `analyze_video` directly:
+
+1. In your current Copilot/Claude chat, send:
+   - `Analyze /absolute/path/to/video.mp4 and explain what broke around login.`
+2. The model can call `analyze_video` once and answer immediately from returned frames.
+3. Optional: ask follow-up questions in the same chat with the same video path.
+
+You can still use the session-based tools when you need tighter token control.
+
 ## Example MCP Calls
+
+### One-shot analysis (balanced)
+
+```json
+{
+  "tool": "analyze_video",
+  "args": {
+    "video_path": "/absolute/path/to/video.mp4",
+    "question": "What UI changes happen after clicking Save?",
+    "ensure_end_frame": true
+  }
+}
+```
+
+### One-shot analysis (flow mode for long user journey)
+
+```json
+{
+  "tool": "analyze_video",
+  "args": {
+    "video_path": "/absolute/path/to/video.mp4",
+    "question": "Where does the onboarding animation stutter?",
+    "resolution_mode": "flow",
+    "max_frames": 22,
+    "max_estimated_tokens": 26000,
+    "strict_evidence": true,
+    "auto_tune": true
+  }
+}
+```
 
 ### Extract references
 
@@ -122,7 +223,8 @@ Deletes temporary files for a session immediately.
   "args": {
     "session_id": "abc123def456",
     "frame_ids": ["frame_0", "frame_2", "frame_4"],
-    "max_frames": 6
+    "max_frames": 6,
+    "max_estimated_tokens": 8000
   }
 }
 ```
@@ -168,6 +270,8 @@ Example MCP config:
 ```
 
 Then restart your MCP server from VS Code/Cursor.
+
+Tip: if your MCP client surfaces prompts, use the `quick_video_review` prompt for a fast one-shot flow.
 
 ## Claude Desktop Setup
 
