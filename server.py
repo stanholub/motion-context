@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import time
 import uuid
+import math
 from threading import Lock
 from threading import Thread
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,6 +25,8 @@ UNIFORM_INTERVAL_SEC = 3.0
 SCENE_DETECT_TIMEOUT_SEC = 12.0
 MAX_RESPONSE_BYTES = 1_000_000
 SIZE_BUDGET_BYTES = 950_000
+ANALYZE_MAX_RESPONSE_BYTES = 8_500_000
+ANALYZE_SIZE_BUDGET_BYTES = 8_000_000
 ESTIMATED_PER_FRAME_OVERHEAD = 220
 VISION_TOKENS_PER_PIXEL_DIVISOR = 512
 ESTIMATED_PER_FRAME_METADATA_TOKENS = 48
@@ -34,7 +37,7 @@ MIN_TIMESTAMP_GAP_SEC = 0.18
 JPEG_QUALITY_FALLBACKS = [90, 82, 74, 66, 58, 50]
 TIMESTAMP_CANDIDATE_MULTIPLIER = 3
 TIMESTAMP_CANDIDATE_EXTRA = 24
-MAX_TIMESTAMP_CANDIDATES = 200
+MAX_TIMESTAMP_CANDIDATES = 1200
 CHANGE_SAMPLE_MIN_FPS = 2.0
 CHANGE_SAMPLE_MAX_FPS = 8.0
 CHANGE_SCORE_MIN_RATIO = 0.25
@@ -45,28 +48,45 @@ SESSION_TTL_SEC = 3600
 MAX_SESSIONS = 20
 TEMP_ROOT_DIR = os.path.join(tempfile.gettempdir(), "mcp-video-context")
 SERVER_VERSION = "ref-sessions-v11"
+AUTO_OVERVIEW_MODE_MIN_DURATION_SEC = 90.0
+MAX_ANALYZE_DURATION_SEC = 150.0
 ANALYZE_RESOLUTION_PRESETS: Dict[str, Dict[str, int]] = {
-    "flow": {
-        "width": 640,
-        "height": 360,
-        "default_max_frames": 28,
-        "max_frames_cap": 64,
-        "default_max_estimated_tokens": 22_000,
-    },
-    "balanced": {
-        "width": 960,
-        "height": 540,
-        "default_max_frames": 14,
-        "max_frames_cap": 40,
-        "default_max_estimated_tokens": 18_000,
-    },
-    "detail": {
+    "precise": {
         "width": 1280,
         "height": 720,
-        "default_max_frames": 8,
-        "max_frames_cap": 8,
+        "default_max_frames": 24,
+        "max_frames_cap": 180,
+        "default_max_estimated_tokens": 42_000,
+    },
+    "overview": {
+        "width": 640,
+        "height": 360,
+        "default_max_frames": 60,
+        "max_frames_cap": 150,
         "default_max_estimated_tokens": 16_000,
     },
+}
+ANALYZE_RESOLUTION_MODE_ALIASES: Dict[str, str] = {
+    "flow": "overview",
+    "balanced": "overview",
+    "detail": "precise",
+    "long": "overview",
+    "low_detail": "overview",
+    "high_detail": "precise",
+}
+MAX_RECOMMENDED_GAP_BY_PROFILE: Dict[str, Tuple[float, float, float]] = {
+    # (<=30s, <=120s, >120s) recommended max gap in seconds
+    "precise": (0.75, 1.15, 1.6),
+    "overview": (1.25, 1.8, 2.5),
+    "session": (1.0, 1.6, 2.2),
+}
+TARGET_FPS_BY_MODE_AND_INTENSITY: Dict[str, Dict[str, float]] = {
+    "precise": {"low": 2.0, "medium": 2.5, "high": 3.0},
+    "overview": {"low": 1.0, "medium": 1.0, "high": 1.0},
+}
+MAX_FPS_BY_MODE: Dict[str, float] = {
+    "precise": 3.0,
+    "overview": 1.0,
 }
 ANALYSIS_INTENSITY_HIGH_KEYWORDS = [
     "every",
@@ -93,14 +113,12 @@ ANALYSIS_INTENSITY_LOW_KEYWORDS = [
     "quick summary",
 ]
 AUTO_MIN_FRAMES_BY_INTENSITY: Dict[str, Dict[str, int]] = {
-    "flow": {"low": 20, "medium": 28, "high": 40},
-    "balanced": {"low": 14, "medium": 20, "high": 28},
-    "detail": {"low": 8, "medium": 8, "high": 8},
+    "precise": {"low": 12, "medium": 18, "high": 24},
+    "overview": {"low": 8, "medium": 12, "high": 16},
 }
 AUTO_MIN_TOKENS_BY_INTENSITY: Dict[str, Dict[str, int]] = {
-    "flow": {"low": 18_000, "medium": 24_000, "high": 32_000},
-    "balanced": {"low": 18_000, "medium": 24_000, "high": 30_000},
-    "detail": {"low": 16_000, "medium": 20_000, "high": 24_000},
+    "precise": {"low": 28_000, "medium": 42_000, "high": 58_000},
+    "overview": {"low": 10_000, "medium": 16_000, "high": 22_000},
 }
 
 mcp = FastMCP("Video Visual Context")
@@ -123,6 +141,15 @@ def _open_capture(video_path: str) -> Tuple[Optional[cv2.VideoCapture], Optional
         duration_sec = frame_count / fps
 
     return cap, fps, duration_sec, None
+
+
+def _probe_video_duration(video_path: str) -> Optional[float]:
+    cap, _, duration_sec, error = _open_capture(video_path)
+    if cap is not None:
+        cap.release()
+    if error:
+        return None
+    return duration_sec
 
 
 def _resize_to_target(frame, target_width: int, target_height: int):
@@ -579,11 +606,23 @@ def _dedupe_sorted_timestamps(values: List[float], min_gap_sec: float = MIN_TIME
     return deduped
 
 
+def _clip_timestamps(values: Optional[List[float]], max_duration_sec: Optional[float]) -> List[float]:
+    if not values:
+        return []
+
+    if max_duration_sec is None or max_duration_sec <= 0:
+        return _dedupe_sorted_timestamps(values)
+
+    clipped = [min(max(0.0, float(value)), float(max_duration_sec)) for value in values]
+    return _dedupe_sorted_timestamps(clipped)
+
+
 def _change_timestamps(
     video_path: str,
     fps: float,
     duration_sec: Optional[float],
     target_count: int,
+    max_duration_sec: Optional[float] = None,
 ) -> List[float]:
     if target_count <= 0:
         return []
@@ -613,6 +652,8 @@ def _change_timestamps(
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             small = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
             timestamp_sec = frame_index / fps if fps > 0 else float(sampled_frames)
+            if max_duration_sec is not None and timestamp_sec > max_duration_sec + 1e-6:
+                break
 
             if prev_small is not None:
                 diff = cv2.absdiff(small, prev_small)
@@ -642,8 +683,15 @@ def _change_timestamps(
             if len(selected) >= target_count:
                 break
 
-    if duration_sec is not None and duration_sec > 0:
-        selected = [min(max(0.0, timestamp), duration_sec) for timestamp in selected]
+    clamp_duration = duration_sec
+    if max_duration_sec is not None and max_duration_sec > 0:
+        if clamp_duration is None:
+            clamp_duration = max_duration_sec
+        else:
+            clamp_duration = min(clamp_duration, max_duration_sec)
+
+    if clamp_duration is not None and clamp_duration > 0:
+        selected = [min(max(0.0, timestamp), clamp_duration) for timestamp in selected]
 
     return _dedupe_sorted_timestamps(selected, min_gap_sec=CHANGE_TIMESTAMP_MIN_GAP_SEC)
 
@@ -651,6 +699,7 @@ def _change_timestamps(
 def _coverage_diagnostics(
     timestamps: List[float],
     duration_sec: Optional[float],
+    profile: str = "session",
 ) -> Dict[str, Any]:
     ordered = sorted(max(0.0, float(ts)) for ts in timestamps)
     if not ordered:
@@ -670,12 +719,18 @@ def _coverage_diagnostics(
     if effective_duration < ordered[-1]:
         effective_duration = ordered[-1]
 
+    threshold_profile = str(profile).strip().lower()
+    short_gap, medium_gap, long_gap = MAX_RECOMMENDED_GAP_BY_PROFILE.get(
+        threshold_profile,
+        MAX_RECOMMENDED_GAP_BY_PROFILE["session"],
+    )
+
     if effective_duration <= 30:
-        recommended_max_gap_sec = 1.5
+        recommended_max_gap_sec = short_gap
     elif effective_duration <= 120:
-        recommended_max_gap_sec = 2.5
+        recommended_max_gap_sec = medium_gap
     else:
-        recommended_max_gap_sec = 4.0
+        recommended_max_gap_sec = long_gap
 
     intervals: List[Tuple[float, float]] = []
     previous = 0.0
@@ -967,6 +1022,7 @@ def _enforce_end_frame(
     target_width: int,
     target_height: int,
     jpeg_quality: int,
+    size_budget_bytes: int,
 ) -> Tuple[List[Dict[str, Any]], int, bool]:
     if duration_sec is None or duration_sec <= 0:
         return frames, approx_bytes, False
@@ -991,7 +1047,7 @@ def _enforce_end_frame(
     updated_frames = list(frames)
     updated_bytes = approx_bytes
 
-    if len(updated_frames) < max_frames and updated_bytes + required_size <= SIZE_BUDGET_BYTES:
+    if len(updated_frames) < max_frames and updated_bytes + required_size <= size_budget_bytes:
         updated_frames.append(required)
         updated_bytes += required_size
         return updated_frames, updated_bytes, True
@@ -1002,7 +1058,7 @@ def _enforce_end_frame(
 
     replaced_size = _frame_payload_size(updated_frames[replace_index])
     new_total = updated_bytes - replaced_size + required_size
-    if new_total > SIZE_BUDGET_BYTES:
+    if new_total > size_budget_bytes:
         return frames, approx_bytes, False
 
     updated_frames[replace_index] = required
@@ -1017,6 +1073,8 @@ def _collect_frames(
     target_width: int = TARGET_WIDTH,
     target_height: int = TARGET_HEIGHT,
     jpeg_quality: int = JPEG_QUALITY,
+    size_budget_bytes: int = SIZE_BUDGET_BYTES,
+    max_response_bytes: int = MAX_RESPONSE_BYTES,
 ) -> Tuple[List[Dict[str, Any]], int, bool, int]:
     frames: List[Dict[str, Any]] = []
     total_size = 0
@@ -1039,7 +1097,7 @@ def _collect_frames(
             continue
 
         estimated_size = _frame_payload_size(encoded)
-        if total_size + estimated_size > SIZE_BUDGET_BYTES:
+        if total_size + estimated_size > size_budget_bytes:
             truncated = True
             skipped_for_size_budget += 1
             continue
@@ -1047,7 +1105,7 @@ def _collect_frames(
         frames.append(encoded)
         total_size += estimated_size
 
-    if total_size > MAX_RESPONSE_BYTES:
+    if total_size > max_response_bytes:
         truncated = True
 
     return frames, total_size, truncated, skipped_for_size_budget
@@ -1061,6 +1119,10 @@ def _extract_representative_frames(
     max_frames_cap: int = MAX_FRAMES,
     max_estimated_tokens: Optional[int] = None,
     ensure_end_frame: bool = True,
+    coverage_profile: str = "session",
+    max_duration_sec: Optional[float] = None,
+    size_budget_bytes: int = SIZE_BUDGET_BYTES,
+    max_response_bytes: int = MAX_RESPONSE_BYTES,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if not os.path.exists(video_path):
         return None, "Video file not found."
@@ -1076,6 +1138,12 @@ def _extract_representative_frames(
 
     if max_frames_cap <= 0:
         return None, "max_frames_cap must be greater than 0."
+    if size_budget_bytes <= 0:
+        return None, "size_budget_bytes must be greater than 0."
+    if max_response_bytes <= 0:
+        return None, "max_response_bytes must be greater than 0."
+    if max_duration_sec is not None and max_duration_sec <= 0:
+        return None, "max_duration_sec must be greater than 0."
 
     effective_max_estimated_tokens: Optional[int] = None
     if max_estimated_tokens is not None:
@@ -1109,25 +1177,37 @@ def _extract_representative_frames(
         ),
     )
 
-    cap, fps, duration_sec, error = _open_capture(video_path)
+    cap, fps, source_duration_sec, error = _open_capture(video_path)
     if error or cap is None or fps is None:
         return None, error or "Failed to open video."
+
+    analysis_duration_sec = source_duration_sec
+    duration_limited = False
+    if max_duration_sec is not None:
+        if analysis_duration_sec is None:
+            analysis_duration_sec = max_duration_sec
+        elif analysis_duration_sec > max_duration_sec:
+            analysis_duration_sec = max_duration_sec
+            duration_limited = True
 
     try:
         method = "uniform"
         scene_status = "skipped"
 
-        scene_timestamps, scene_status = _scene_timestamps(video_path, duration_sec, fps)
+        scene_timestamps, scene_status = _scene_timestamps(video_path, analysis_duration_sec, fps)
+        scene_timestamps = _clip_timestamps(scene_timestamps, analysis_duration_sec)
         change_timestamps = _change_timestamps(
             video_path=video_path,
             fps=fps,
-            duration_sec=duration_sec,
+            duration_sec=analysis_duration_sec,
             target_count=max(candidate_target_count, effective_max_frames + 4),
+            max_duration_sec=analysis_duration_sec,
         )
+        change_timestamps = _clip_timestamps(change_timestamps, analysis_duration_sec)
         timestamps, method = _build_coverage_timestamps(
             scene_timestamps=scene_timestamps,
             change_timestamps=change_timestamps,
-            duration_sec=duration_sec,
+            duration_sec=analysis_duration_sec,
             target_count=candidate_target_count,
         )
         collection_timestamps = _collection_order_timestamps(
@@ -1136,7 +1216,7 @@ def _extract_representative_frames(
         )
         collection_timestamps = _sanitize_collection_timestamps(
             timestamps=collection_timestamps,
-            duration_sec=duration_sec,
+            duration_sec=analysis_duration_sec,
             fps=fps,
         )
 
@@ -1160,12 +1240,14 @@ def _extract_representative_frames(
                 target_width=target_width,
                 target_height=target_height,
                 jpeg_quality=candidate_quality,
+                size_budget_bytes=size_budget_bytes,
+                max_response_bytes=max_response_bytes,
             )
 
             frame_count = len(frames_with_bytes)
             candidate_tail_gap = (
-                max(0.0, float(duration_sec) - float(max(frame["timestamp_sec"] for frame in frames_with_bytes)))
-                if frames_with_bytes and duration_sec is not None and duration_sec > 0
+                max(0.0, float(analysis_duration_sec) - float(max(frame["timestamp_sec"] for frame in frames_with_bytes)))
+                if frames_with_bytes and analysis_duration_sec is not None and analysis_duration_sec > 0
                 else float("inf")
             )
             should_replace = False
@@ -1205,11 +1287,12 @@ def _extract_representative_frames(
                 fps=fps,
                 frames=frames_with_bytes,
                 approx_bytes=approx_bytes,
-                duration_sec=duration_sec,
+                duration_sec=analysis_duration_sec,
                 max_frames=effective_max_frames,
                 target_width=target_width,
                 target_height=target_height,
                 jpeg_quality=jpeg_quality_used,
+                size_budget_bytes=size_budget_bytes,
             )
             if end_frame_forced:
                 frames_with_bytes = sorted(
@@ -1226,13 +1309,15 @@ def _extract_representative_frames(
         return None, "Failed to extract frames from video."
 
     frame_timestamps = [float(frame["timestamp_sec"]) for frame in frames_with_bytes]
-    coverage = _coverage_diagnostics(frame_timestamps, duration_sec)
+    coverage = _coverage_diagnostics(frame_timestamps, analysis_duration_sec, profile=coverage_profile)
 
     return (
         {
             "method": method,
             "scene_detection": scene_status,
-            "duration_sec": duration_sec,
+            "duration_sec": analysis_duration_sec,
+            "source_duration_sec": source_duration_sec,
+            "duration_limited": duration_limited,
             "approx_bytes": approx_bytes,
             "truncated": truncated,
             "frames": frames_with_bytes,
@@ -1266,21 +1351,83 @@ def _resolve_analyze_settings(
     max_estimated_tokens: Optional[int],
     question: str,
     auto_tune: bool,
+    duration_sec_hint: Optional[float],
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    mode = str(resolution_mode).strip().lower()
+    raw_mode = str(resolution_mode).strip().lower()
+    if not raw_mode:
+        raw_mode = "auto"
+
+    mode_auto_selected = False
+    mode_selection_reason: Optional[str] = None
+    requested_mode = raw_mode
+
+    if raw_mode == "auto":
+        mode_auto_selected = True
+        if duration_sec_hint is not None and duration_sec_hint >= AUTO_OVERVIEW_MODE_MIN_DURATION_SEC:
+            mode = "overview"
+            mode_selection_reason = (
+                f"auto-selected overview mode for duration >= {AUTO_OVERVIEW_MODE_MIN_DURATION_SEC:.0f}s"
+            )
+        else:
+            mode = "precise"
+            mode_selection_reason = (
+                f"auto-selected precise mode for duration < {AUTO_OVERVIEW_MODE_MIN_DURATION_SEC:.0f}s"
+                if duration_sec_hint is not None
+                else "auto-selected precise mode (duration unknown)"
+            )
+    else:
+        mode = ANALYZE_RESOLUTION_MODE_ALIASES.get(raw_mode, raw_mode)
+        if raw_mode in ANALYZE_RESOLUTION_MODE_ALIASES:
+            mode_selection_reason = f"mode alias '{raw_mode}' mapped to '{mode}'"
+
     preset = ANALYZE_RESOLUTION_PRESETS.get(mode)
     if preset is None:
-        allowed = ", ".join(sorted(ANALYZE_RESOLUTION_PRESETS.keys()))
-        return None, f"resolution_mode must be one of: {allowed}."
+        canonical_modes = ", ".join(sorted(ANALYZE_RESOLUTION_PRESETS.keys()))
+        alias_modes = ", ".join(sorted(ANALYZE_RESOLUTION_MODE_ALIASES.keys()))
+        return (
+            None,
+            "resolution_mode must be one of: auto, "
+            f"{canonical_modes} (legacy aliases: {alias_modes}).",
+        )
+
+    intensity = _infer_analysis_intensity(question)
+    duration_sec_planned = (
+        min(float(duration_sec_hint), MAX_ANALYZE_DURATION_SEC)
+        if duration_sec_hint is not None and duration_sec_hint > 0
+        else None
+    )
+    target_fps = float(TARGET_FPS_BY_MODE_AND_INTENSITY[mode][intensity])
+    max_fps = float(MAX_FPS_BY_MODE[mode])
+
+    duration_based_default_frames = (
+        max(1, int(math.ceil(duration_sec_planned * target_fps)))
+        if duration_sec_planned is not None
+        else None
+    )
+    duration_based_max_frames = (
+        max(1, int(math.ceil(duration_sec_planned * max_fps)))
+        if duration_sec_planned is not None
+        else None
+    )
+
+    default_max_frames = (
+        int(duration_based_default_frames)
+        if duration_based_default_frames is not None
+        else int(preset["default_max_frames"])
+    )
+    max_frames_cap = (
+        int(duration_based_max_frames)
+        if duration_based_max_frames is not None
+        else int(preset["max_frames_cap"])
+    )
 
     if max_frames is None:
-        requested_max_frames_raw = int(preset["default_max_frames"])
+        requested_max_frames_raw = default_max_frames
     else:
         if max_frames <= 0:
             return None, "max_frames must be greater than 0."
         requested_max_frames_raw = max_frames
 
-    max_frames_cap = int(preset["max_frames_cap"])
     default_max_estimated_tokens = int(preset["default_max_estimated_tokens"])
     if max_estimated_tokens is None:
         requested_max_estimated_tokens_raw = default_max_estimated_tokens
@@ -1289,15 +1436,32 @@ def _resolve_analyze_settings(
             return None, "max_estimated_tokens must be greater than 0."
         requested_max_estimated_tokens_raw = max_estimated_tokens
 
-    intensity = _infer_analysis_intensity(question)
     auto_min_frames = int(AUTO_MIN_FRAMES_BY_INTENSITY[mode][intensity])
     auto_min_tokens = int(AUTO_MIN_TOKENS_BY_INTENSITY[mode][intensity])
 
     auto_adjusted_max_frames = False
     auto_adjusted_max_estimated_tokens = False
+    duration_adjusted_max_frames = False
+    duration_adjusted_max_estimated_tokens = False
 
     requested_max_frames = requested_max_frames_raw
     requested_max_estimated_tokens = requested_max_estimated_tokens_raw
+    estimated_tokens_per_frame = _estimate_frame_tokens(
+        width=int(preset["width"]),
+        height=int(preset["height"]),
+    )
+
+    if requested_max_frames > max_frames_cap:
+        requested_max_frames = max_frames_cap
+        duration_adjusted_max_frames = True
+
+    # When caller does not specify a token budget, provision enough tokens for
+    # the frame target so duration-driven defaults are actually reachable.
+    if max_estimated_tokens is None:
+        min_tokens_for_requested_frames = int(math.ceil(requested_max_frames * estimated_tokens_per_frame * 1.1))
+        if requested_max_estimated_tokens < min_tokens_for_requested_frames:
+            requested_max_estimated_tokens = min_tokens_for_requested_frames
+            duration_adjusted_max_estimated_tokens = True
 
     if auto_tune:
         tuned_frame_floor = min(max_frames_cap, auto_min_frames)
@@ -1305,10 +1469,6 @@ def _resolve_analyze_settings(
             requested_max_frames = tuned_frame_floor
             auto_adjusted_max_frames = True
 
-        estimated_tokens_per_frame = _estimate_frame_tokens(
-            width=int(preset["width"]),
-            height=int(preset["height"]),
-        )
         min_tokens_for_frames = int(requested_max_frames * estimated_tokens_per_frame * 1.15)
         tuned_token_floor = max(auto_min_tokens, min_tokens_for_frames)
         if requested_max_estimated_tokens < tuned_token_floor:
@@ -1320,9 +1480,17 @@ def _resolve_analyze_settings(
     return (
         {
             "resolution_mode": mode,
+            "requested_resolution_mode": requested_mode,
+            "mode_auto_selected": mode_auto_selected,
+            "mode_selection_reason": mode_selection_reason,
+            "duration_sec_hint": duration_sec_hint,
+            "duration_sec_planned": duration_sec_planned,
+            "analysis_duration_cap_sec": MAX_ANALYZE_DURATION_SEC,
+            "target_fps": target_fps,
+            "max_fps": max_fps,
             "target_width": int(preset["width"]),
             "target_height": int(preset["height"]),
-            "default_max_frames": int(preset["default_max_frames"]),
+            "default_max_frames": default_max_frames,
             "requested_max_frames": requested_max_frames,
             "requested_max_frames_raw": requested_max_frames_raw,
             "max_frames_cap": max_frames_cap,
@@ -1332,6 +1500,8 @@ def _resolve_analyze_settings(
             "effective_max_estimated_tokens": effective_max_estimated_tokens,
             "analysis_intensity": intensity,
             "auto_tune": auto_tune,
+            "duration_adjusted_max_frames": duration_adjusted_max_frames,
+            "duration_adjusted_max_estimated_tokens": duration_adjusted_max_estimated_tokens,
             "auto_adjusted_max_frames": auto_adjusted_max_frames,
             "auto_adjusted_max_estimated_tokens": auto_adjusted_max_estimated_tokens,
             "auto_min_frames": auto_min_frames,
@@ -1357,6 +1527,7 @@ def get_visual_context(video_path: str) -> ToolResult:
         max_frames_cap=MAX_FRAMES,
         max_estimated_tokens=None,
         ensure_end_frame=True,
+        coverage_profile="session",
     )
     if error:
         return ToolResult(
@@ -1436,7 +1607,7 @@ def analyze_video(
     video_path: str,
     question: str = "Summarize the key visual events in this video.",
     max_frames: Optional[int] = None,
-    resolution_mode: str = "balanced",
+    resolution_mode: str = "auto",
     max_estimated_tokens: Optional[int] = None,
     strict_evidence: bool = True,
     auto_tune: bool = True,
@@ -1453,6 +1624,7 @@ def analyze_video(
         max_estimated_tokens=max_estimated_tokens,
         question=question,
         auto_tune=auto_tune,
+        duration_sec_hint=_probe_video_duration(video_path),
     )
     if settings_error:
         return ToolResult(
@@ -1473,6 +1645,10 @@ def analyze_video(
         max_frames_cap=int(settings["max_frames_cap"]),
         max_estimated_tokens=int(settings["effective_max_estimated_tokens"]),
         ensure_end_frame=bool(ensure_end_frame),
+        coverage_profile=str(settings["resolution_mode"]),
+        max_duration_sec=MAX_ANALYZE_DURATION_SEC,
+        size_budget_bytes=ANALYZE_SIZE_BUDGET_BYTES,
+        max_response_bytes=ANALYZE_MAX_RESPONSE_BYTES,
     )
     if error:
         return ToolResult(
@@ -1519,19 +1695,37 @@ def analyze_video(
             "Strict evidence mode: only describe what is visible in returned frames. "
             "Do not infer unseen UI actions, backend results, or navigation state."
         )
+    if settings["mode_auto_selected"] and settings["mode_selection_reason"]:
+        summary_parts.append(f"Mode selection: {settings['mode_selection_reason']}.")
+    elif settings["requested_resolution_mode"] != settings["resolution_mode"]:
+        summary_parts.append(
+            f"Mode alias '{settings['requested_resolution_mode']}' resolved to '{settings['resolution_mode']}'."
+        )
+    if extraction["duration_limited"] and extraction["source_duration_sec"] is not None:
+        summary_parts.append(
+            "Duration cap applied: analyzed first "
+            f"{MAX_ANALYZE_DURATION_SEC:.0f}s of {round(float(extraction['source_duration_sec']), 3)}s source video."
+        )
     if max_frames is None:
         summary_parts.append(
             f"max_frames defaulted to {settings['default_max_frames']} for this mode."
         )
-    if int(settings["requested_max_frames"]) > int(settings["max_frames_cap"]):
+    if settings["duration_adjusted_max_frames"]:
         summary_parts.append(
             f"max_frames capped to {settings['max_frames_cap']} for {settings['resolution_mode']} mode."
         )
     if max_estimated_tokens is None:
-        summary_parts.append(
-            "Token guard used mode default budget "
-            f"({settings['default_max_estimated_tokens']} tokens)."
-        )
+        if settings["duration_adjusted_max_estimated_tokens"]:
+            summary_parts.append(
+                "Token guard raised mode default budget "
+                f"({settings['default_max_estimated_tokens']}) to "
+                f"{settings['requested_max_estimated_tokens']} for duration-based frame density."
+            )
+        else:
+            summary_parts.append(
+                "Token guard used mode default budget "
+                f"({settings['default_max_estimated_tokens']} tokens)."
+            )
     if int(settings["requested_max_estimated_tokens"]) > MAX_ESTIMATED_TOKENS_HARD_CAP:
         summary_parts.append(
             f"max_estimated_tokens capped to hard limit ({MAX_ESTIMATED_TOKENS_HARD_CAP})."
@@ -1598,6 +1792,22 @@ def analyze_video(
             "video_path": video_path,
             "question": question,
             "resolution_mode": settings["resolution_mode"],
+            "requested_resolution_mode": settings["requested_resolution_mode"],
+            "mode_auto_selected": settings["mode_auto_selected"],
+            "mode_selection_reason": settings["mode_selection_reason"],
+            "duration_sec_hint": (
+                round(float(settings["duration_sec_hint"]), 3)
+                if settings["duration_sec_hint"] is not None
+                else None
+            ),
+            "duration_sec_planned": (
+                round(float(settings["duration_sec_planned"]), 3)
+                if settings["duration_sec_planned"] is not None
+                else None
+            ),
+            "analysis_duration_cap_sec": settings["analysis_duration_cap_sec"],
+            "target_fps": settings["target_fps"],
+            "max_fps": settings["max_fps"],
             "target_width": settings["target_width"],
             "target_height": settings["target_height"],
             "method": extraction["method"],
@@ -1612,6 +1822,12 @@ def analyze_video(
                 if extraction["duration_sec"]
                 else None
             ),
+            "source_duration_sec": (
+                round(float(extraction["source_duration_sec"]), 3)
+                if extraction["source_duration_sec"] is not None
+                else None
+            ),
+            "duration_limited": extraction["duration_limited"],
             "default_max_frames": settings["default_max_frames"],
             "requested_max_frames": settings["requested_max_frames"],
             "requested_max_frames_raw": settings["requested_max_frames_raw"],
@@ -1620,6 +1836,8 @@ def analyze_video(
             "requested_max_estimated_tokens": settings["requested_max_estimated_tokens"],
             "requested_max_estimated_tokens_raw": settings["requested_max_estimated_tokens_raw"],
             "effective_max_estimated_tokens": settings["effective_max_estimated_tokens"],
+            "duration_adjusted_max_frames": settings["duration_adjusted_max_frames"],
+            "duration_adjusted_max_estimated_tokens": settings["duration_adjusted_max_estimated_tokens"],
             "auto_adjusted_max_frames": settings["auto_adjusted_max_frames"],
             "auto_adjusted_max_estimated_tokens": settings["auto_adjusted_max_estimated_tokens"],
             "auto_min_frames": settings["auto_min_frames"],
@@ -1655,7 +1873,7 @@ def analyze_video(
 def quick_video_review(
     video_path: str,
     question: str = "Summarize the key visual events in this video.",
-    resolution_mode: str = "balanced",
+    resolution_mode: str = "auto",
     max_estimated_tokens: Optional[int] = None,
     strict_evidence: bool = True,
     auto_tune: bool = True,

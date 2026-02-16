@@ -13,9 +13,11 @@ frames and metadata in a single call.
 
 - Coverage-first representative frame selection (scene + visual-change + uniform sampling).
 - Scene detection timeout fallback with non-scene sampling to preserve coverage.
-- Session extraction output target: `1280x720`; one-shot analysis supports mode presets (`640x360`, `960x540`, `1280x720`).
+- Session extraction output target: `1280x720`; one-shot analysis supports mode presets with auto-selection (`overview=640x360`, `precise=1280x720`).
+- Duration-aware frame density for one-shot analysis (`overview`: up to `1 FPS`; `precise`: up to `3 FPS` depending on intent).
+- One-shot analysis window cap: first `150s` (`2.5 min`) of the input video.
 - Adaptive JPEG quality fallback (`95 -> 90 -> 82 -> 74 -> 66 -> 58 -> 50`) when needed for response-size coverage.
-- Max `8` frames per session extraction (`get_visual_context` / `get_visual_frames`); one-shot `analyze_video` allows higher mode caps.
+- Max `8` frames per session extraction (`get_visual_context` / `get_visual_frames`); one-shot `analyze_video` supports higher dynamic frame counts.
 - Temporary frame sessions with automatic expiration and cleanup.
 
 ## Requirements
@@ -88,7 +90,7 @@ Notes:
 
 ## MCP Tools
 
-### `analyze_video(video_path: str, question?: str, max_frames?: number, resolution_mode?: "flow" | "balanced" | "detail", max_estimated_tokens?: number, strict_evidence?: boolean, auto_tune?: boolean, ensure_end_frame?: boolean)`
+### `analyze_video(video_path: str, question?: str, max_frames?: number, resolution_mode?: "auto" | "precise" | "overview", max_estimated_tokens?: number, strict_evidence?: boolean, auto_tune?: boolean, ensure_end_frame?: boolean)`
 
 One-shot tool for seamless chat usage.
 
@@ -107,13 +109,20 @@ For sparse scene detection, the tool automatically blends scene cuts, visual-cha
 sampling, and uniform coverage to preserve long-flow context.
 
 Resolution modes:
-- `flow`: `640x360`, default `28` frames, cap `64` (best for long flows/animation debugging)
-- `balanced`: `960x540`, default `14` frames, cap `40` (recommended default)
-- `detail`: `1280x720`, default `8` frames, cap `8` (best for tiny text/detail)
+- `auto` (default): if video duration is `>= 90s`, server selects `overview`; otherwise `precise`
+- `precise`: `1280x720`, duration-based target density (`~2.0..3.0 FPS` by question intent), max `3 FPS`
+- `overview`: `640x360`, duration-based target density (`1 FPS`), max `1 FPS`
+- for a `14s` clip this means defaults are at least `14` frames in `overview`, and typically `28..42` in `precise`
+- no small static frame cap is used when duration is known; cap is duration-derived from mode FPS policy
+- videos longer than `150s` are truncated to first `150s` for one-shot analysis
+- backward-compatible aliases are accepted: `detail -> precise`, `balanced -> overview`, `flow -> overview`, `long -> overview`
 
 Token guard:
-- per-mode default token budgets: `flow=22000`, `balanced=18000`, `detail=16000`
+- per-mode starting budgets: `precise=42000`, `overview=16000`
 - hard ceiling for any request: `75000`
+- per-frame estimate: `ceil(width * height / 512) + 48` tokens
+- effective frame cap from tokens: `floor(effective_max_estimated_tokens / estimated_tokens_per_frame)`
+- if `max_estimated_tokens` is omitted, server can raise the mode default budget to support duration-driven frame targets
 - if exceeded, frames are reduced automatically and `token_limited` is returned
 - session-based tools (`get_visual_frame`, `get_visual_frames`) also enforce cumulative
   session budget (`75000` by default) and stop once exhausted
@@ -122,8 +131,8 @@ Anti-hallucination guard:
 - `strict_evidence` defaults to `true`
 - when enabled, consumers should only describe visible evidence and mark uncovered
   intervals as unknown (see `uncertain_intervals`)
-- for short, action-heavy clips, start with `resolution_mode="flow"` and
-  `max_frames=24..40` to capture micro-interactions
+- for short, action-heavy clips, use `resolution_mode="precise"` and increase
+  `max_frames`/`max_estimated_tokens` as needed for micro-interactions
 
 Coverage guard:
 - extraction is coverage-first: candidate timestamps are ordered to prioritize
@@ -133,6 +142,8 @@ Coverage guard:
   so later timestamps can still be included
 - `ensure_end_frame=true` (default) attempts to add/replace a frame near the video end
   if tail coverage is missing
+- coverage thresholds are stricter by profile (no `4s` recommendation):
+  `precise <= 1.6s`, `overview <= 2.5s`, `session <= 2.2s` on longer videos
 - inspect `tail_gap_sec` and `coverage_percentage`; if `tail_gap_sec` is above
   `recommended_max_gap_sec`, treat the ending as uncertain
 
@@ -179,7 +190,7 @@ Deletes temporary files for a session immediately.
 
 ## MCP Prompts
 
-### `quick_video_review(video_path: str, question?: str, resolution_mode?: "flow" | "balanced" | "detail", max_estimated_tokens?: number, strict_evidence?: boolean, auto_tune?: boolean, ensure_end_frame?: boolean)`
+### `quick_video_review(video_path: str, question?: str, resolution_mode?: "auto" | "precise" | "overview", max_estimated_tokens?: number, strict_evidence?: boolean, auto_tune?: boolean, ensure_end_frame?: boolean)`
 
 Prompt shortcut that asks the client to call `analyze_video` with sensible defaults.
 
@@ -203,7 +214,7 @@ You can still use the session-based tools when you need tighter token control.
 
 ## Example MCP Calls
 
-### One-shot analysis (balanced)
+### One-shot analysis (auto mode)
 
 ```json
 {
@@ -216,7 +227,7 @@ You can still use the session-based tools when you need tighter token control.
 }
 ```
 
-### One-shot analysis (flow mode for long user journey)
+### One-shot analysis (overview mode for user journey)
 
 ```json
 {
@@ -224,7 +235,7 @@ You can still use the session-based tools when you need tighter token control.
   "args": {
     "video_path": "/absolute/path/to/video.mp4",
     "question": "Where does the onboarding animation stutter?",
-    "resolution_mode": "flow",
+    "resolution_mode": "overview",
     "max_frames": 22,
     "max_estimated_tokens": 26000,
     "strict_evidence": true,
