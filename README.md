@@ -13,7 +13,7 @@ frames and metadata in a single call.
 
 - Coverage-first representative frame selection (scene + visual-change + uniform sampling).
 - Scene detection timeout fallback with non-scene sampling to preserve coverage.
-- Session extraction output target: `1280x720`; one-shot analysis supports mode presets with auto-selection (`overview=640x360`, `precise=1280x720`).
+- Session extraction output target: `1280x720`; one-shot analysis supports mode presets with `auto` defaulting to `overview` (`overview=640x360`, `precise=1280x720`).
 - Duration-aware frame density for one-shot analysis (`overview`: up to `1 FPS`; `precise`: up to `3 FPS` depending on intent).
 - One-shot analysis window cap: first `150s` (`2.5 min`) of the input video.
 - Adaptive JPEG quality fallback (`95 -> 90 -> 82 -> 74 -> 66 -> 58 -> 50`) when needed for response-size coverage.
@@ -109,9 +109,9 @@ For sparse scene detection, the tool automatically blends scene cuts, visual-cha
 sampling, and uniform coverage to preserve long-flow context.
 
 Resolution modes:
-- `auto` (default): if video duration is `>= 90s`, server selects `overview`; otherwise `precise`
+- `auto` (default): always selects `overview`; use `resolution_mode="precise"` when you explicitly need high-detail analysis
 - `precise`: `1280x720`, duration-based target density (`~2.0..3.0 FPS` by question intent), max `3 FPS`
-- `overview`: `640x360`, duration-based target density (`1 FPS`), max `1 FPS`
+- `overview`: `640x360` (longest side capped at `672px`), duration-based target density (`1 FPS`), max `1 FPS`
 - for a `14s` clip this means defaults are at least `14` frames in `overview`, and typically `28..42` in `precise`
 - no small static frame cap is used when duration is known; cap is duration-derived from mode FPS policy
 - videos longer than `150s` are truncated to first `150s` for one-shot analysis

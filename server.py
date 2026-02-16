@@ -48,7 +48,7 @@ SESSION_TTL_SEC = 3600
 MAX_SESSIONS = 20
 TEMP_ROOT_DIR = os.path.join(tempfile.gettempdir(), "mcp-video-context")
 SERVER_VERSION = "ref-sessions-v11"
-AUTO_OVERVIEW_MODE_MIN_DURATION_SEC = 90.0
+OVERVIEW_MAX_LONG_SIDE = 672
 MAX_ANALYZE_DURATION_SEC = 150.0
 ANALYZE_RESOLUTION_PRESETS: Dict[str, Dict[str, int]] = {
     "precise": {
@@ -209,6 +209,27 @@ def _estimate_image_tokens(width: int, height: int) -> int:
 
 def _estimate_frame_tokens(width: int, height: int) -> int:
     return _estimate_image_tokens(width, height) + ESTIMATED_PER_FRAME_METADATA_TOKENS
+
+
+def _clamp_long_side(width: int, height: int, max_long_side: int) -> Tuple[int, int]:
+    width_int = max(1, int(width))
+    height_int = max(1, int(height))
+    cap = max(1, int(max_long_side))
+    longest = max(width_int, height_int)
+    if longest <= cap:
+        return width_int, height_int
+
+    scale = cap / float(longest)
+    scaled_w = max(1, int(round(width_int * scale)))
+    scaled_h = max(1, int(round(height_int * scale)))
+    if max(scaled_w, scaled_h) > cap:
+        if scaled_w >= scaled_h:
+            scaled_w = cap
+            scaled_h = max(1, int(round(height_int * (cap / float(width_int)))))
+        else:
+            scaled_h = cap
+            scaled_w = max(1, int(round(width_int * (cap / float(height_int)))))
+    return scaled_w, scaled_h
 
 
 def _infer_analysis_intensity(question: str) -> str:
@@ -1363,18 +1384,8 @@ def _resolve_analyze_settings(
 
     if raw_mode == "auto":
         mode_auto_selected = True
-        if duration_sec_hint is not None and duration_sec_hint >= AUTO_OVERVIEW_MODE_MIN_DURATION_SEC:
-            mode = "overview"
-            mode_selection_reason = (
-                f"auto-selected overview mode for duration >= {AUTO_OVERVIEW_MODE_MIN_DURATION_SEC:.0f}s"
-            )
-        else:
-            mode = "precise"
-            mode_selection_reason = (
-                f"auto-selected precise mode for duration < {AUTO_OVERVIEW_MODE_MIN_DURATION_SEC:.0f}s"
-                if duration_sec_hint is not None
-                else "auto-selected precise mode (duration unknown)"
-            )
+        mode = "overview"
+        mode_selection_reason = "auto-selected overview mode by default; use resolution_mode='precise' to override"
     else:
         mode = ANALYZE_RESOLUTION_MODE_ALIASES.get(raw_mode, raw_mode)
         if raw_mode in ANALYZE_RESOLUTION_MODE_ALIASES:
@@ -1446,9 +1457,18 @@ def _resolve_analyze_settings(
 
     requested_max_frames = requested_max_frames_raw
     requested_max_estimated_tokens = requested_max_estimated_tokens_raw
+    target_width = int(preset["width"])
+    target_height = int(preset["height"])
+    if mode == "overview":
+        target_width, target_height = _clamp_long_side(
+            width=target_width,
+            height=target_height,
+            max_long_side=OVERVIEW_MAX_LONG_SIDE,
+        )
+
     estimated_tokens_per_frame = _estimate_frame_tokens(
-        width=int(preset["width"]),
-        height=int(preset["height"]),
+        width=target_width,
+        height=target_height,
     )
 
     if requested_max_frames > max_frames_cap:
@@ -1488,8 +1508,8 @@ def _resolve_analyze_settings(
             "analysis_duration_cap_sec": MAX_ANALYZE_DURATION_SEC,
             "target_fps": target_fps,
             "max_fps": max_fps,
-            "target_width": int(preset["width"]),
-            "target_height": int(preset["height"]),
+            "target_width": target_width,
+            "target_height": target_height,
             "default_max_frames": default_max_frames,
             "requested_max_frames": requested_max_frames,
             "requested_max_frames_raw": requested_max_frames_raw,
